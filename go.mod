@@ -58,3 +58,5 @@ require (
 // If you change this please run `make lint` to see where else it needs to be
 // updated as well.
 go 1.24.6
+
+replace github.com/lightninglabs/gozmq => github.com/Abdulkbk/gozmq v0.0.0-20260309124316-1453bedff97c

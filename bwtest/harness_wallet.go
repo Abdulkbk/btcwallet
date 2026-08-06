@@ -1,9 +1,11 @@
 package bwtest
 
 import (
+	"bytes"
 	"strings"
 	"time"
 
+	"github.com/btcsuite/btcd/address/v2"
 	"github.com/btcsuite/btcd/btcutil/v2"
 	"github.com/btcsuite/btcd/txscript/v2"
 	"github.com/btcsuite/btcd/wire/v2"
@@ -91,39 +93,158 @@ func (h *HarnessTest) CreateEmptyWallet() *wallet.Wallet {
 }
 
 // CreateFundedWallet creates an empty wallet and funds it with 10 BTC.
-//
-// This is intended for future integration tests that need spendable funds.
 func (h *HarnessTest) CreateFundedWallet() *wallet.Wallet {
 	h.Helper()
 
 	w := h.CreateEmptyWallet()
 
-	err := w.Unlock(h.Context(), wallet.UnlockRequest{
+	const tenBTC = 10 * btcutil.SatoshiPerBitcoin
+
+	h.FundWallet(w, tenBTC)
+
+	return w
+}
+
+// fundingAddrType is the address type FundWallet derives funding addresses
+// for.
+const fundingAddrType = waddrmgr.WitnessPubKey
+
+// UnlockWallet unlocks the wallet if it is locked, and is a no-op otherwise.
+//
+// Unlock is not idempotent: the key vault rejects a second Unlock on an
+// already-unlocked wallet, so the state is checked first. Timeout -1 disables
+// auto-lock, keeping assertions from racing against a re-lock.
+func (h *HarnessTest) UnlockWallet(w *wallet.Wallet) {
+	h.Helper()
+
+	info, err := w.Info(h.Context())
+	require.NoError(h, err, "failed to query wallet info")
+
+	if !info.Locked {
+		return
+	}
+
+	err = w.Unlock(h.Context(), wallet.UnlockRequest{
 		Passphrase: []byte(TestWalletPrivatePassphrase),
+		Timeout:    -1,
 	})
 	require.NoError(h, err, "failed to unlock wallet")
+}
+
+// NewWalletAddress derives a fresh receive address from the wallet's default
+// account, unlocking the wallet and ensuring the account exists first.
+//
+// The wallet must be started.
+//
+// kvdb seeds a default account for every default scope at wallet creation
+// while the SQL backends create accounts on demand, so the account is ensured
+// here to keep address derivation backend-agnostic. The scope is derived from
+// the address type so the ensured account and the derived address cannot drift
+// into different scopes.
+func (h *HarnessTest) NewWalletAddress(w *wallet.Wallet) address.Address {
+	h.Helper()
+
+	h.UnlockWallet(w)
+
+	scope, err := fundingAddrType.KeyScope()
+	require.NoError(h, err, "failed to resolve funding address scope")
+
+	h.ensureAccount(w, scope, waddrmgr.DefaultAccountName)
 
 	addr, err := w.NewAddress(
-		h.Context(), waddrmgr.DefaultAccountName,
-		waddrmgr.WitnessPubKey, false,
+		h.Context(), waddrmgr.DefaultAccountName, fundingAddrType, false,
 	)
 	require.NoError(h, err, "failed to create address")
 
-	pkScript, err := txscript.PayToAddrScript(addr)
-	require.NoError(h, err, "failed to create pkscript")
+	return addr
+}
 
-	const tenBTC = 10 * btcutil.SatoshiPerBitcoin
+// FundWallet unlocks the wallet, pays one output per amount to fresh wallet
+// addresses in a single miner transaction, confirms it, and returns the
+// wallet outpoints in the order of the amounts argument.
+//
+// The wallet must be started.
+//
+// The miner's mempool must be empty when this is called. The funding
+// transaction is mined with MineBlockWithTx, which requires it to be the only
+// mempool transaction; MineBlocks cannot be used because it rejects blocks
+// that contain non-coinbase transactions.
+func (h *HarnessTest) FundWallet(w *wallet.Wallet,
+	amounts ...btcutil.Amount) []wire.OutPoint {
 
-	output := &wire.TxOut{Value: int64(tenBTC), PkScript: pkScript}
+	h.Helper()
 
-	// Use a minimal fee rate for regtest.
-	h.SendOutput(output, btcutil.Amount(1))
+	outputs := make([]*wire.TxOut, 0, len(amounts))
+	for _, amount := range amounts {
+		addr := h.NewWalletAddress(w)
 
-	// Confirm and wait for sync.
-	h.MineBlocks(1)
-	h.AssertWalletSynced(w)
+		pkScript, err := txscript.PayToAddrScript(addr)
+		require.NoError(h, err, "failed to create pkscript")
 
-	return w
+		outputs = append(outputs, &wire.TxOut{
+			Value:    int64(amount),
+			PkScript: pkScript,
+		})
+	}
+
+	txid := h.SendOutputs(outputs, MinerFeeRate)
+
+	// Confirm the funding transaction and wait for every registered wallet
+	// to sync the mined block.
+	tx := h.AssertTxInMempool(*txid)
+	h.MineBlockWithTx(tx)
+
+	// Locate each wallet output's index within the funding transaction so
+	// callers receive ready-to-use outpoints in the order of the amounts
+	// argument.
+	outpoints := make([]wire.OutPoint, 0, len(outputs))
+	for _, output := range outputs {
+		index := -1
+
+		for i, txOut := range tx.TxOut {
+			if bytes.Equal(txOut.PkScript, output.PkScript) {
+				index = i
+
+				break
+			}
+		}
+
+		require.NotEqual(h, -1, index,
+			"funding output missing from transaction")
+
+		outpoints = append(outpoints, wire.OutPoint{
+			Hash:  *txid,
+			Index: uint32(index), //nolint:gosec
+		})
+	}
+
+	return outpoints
+}
+
+// ensureAccount makes sure an account exists for the given key scope,
+// creating it when the backend did not seed it at wallet creation.
+//
+// Any lookup error is treated as "account missing": the not-found sentinel is
+// backend-dependent (kvdb returns a waddrmgr.ManagerError while the SQL
+// backends return an internal db sentinel callers cannot match), so there is
+// no backend-agnostic way to distinguish a missing account from a genuine
+// lookup failure. If the lookup failed for another reason, the creation
+// failure message still names the original lookup error.
+func (h *HarnessTest) ensureAccount(w *wallet.Wallet,
+	scope waddrmgr.KeyScope, name string) {
+
+	h.Helper()
+
+	_, err := w.GetAccount(h.Context(), scope, name)
+	if err == nil {
+		return
+	}
+
+	lookupErr := err
+
+	_, err = w.NewAccount(h.Context(), scope, name)
+	require.NoError(h, err,
+		"failed to create account %q (lookup error: %v)", name, lookupErr)
 }
 
 // init uses fast scrypt options for tests to avoid CPU exhaustion and timeouts,

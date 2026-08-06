@@ -49,6 +49,21 @@ const (
 	// contains only a coinbase transaction and a single non-coinbase
 	// transaction.
 	coinbaseAndOneTxn = 2
+
+	// MinerFeeRate is the fee rate, in satoshis per byte, used for
+	// miner-funded test transactions.
+	//
+	// It is deliberately above 1 sat/byte. rpctest's memWallet derives the fee
+	// from the transaction size measured *before* its change output is
+	// appended, so a rate of 1 produces an effective rate just under 1 sat/vB.
+	// That is below the default minrelaytxfee of Bitcoin Core v28 and earlier,
+	// which rejects the transaction outright, so it never reaches the backend's
+	// mempool and no unconfirmed notification is ever emitted. Core v30 lowered
+	// that default, which is why too low a rate only fails on older versions.
+	//
+	// Transactions the miner mines itself are unaffected, since blocks bypass
+	// relay policy; only transactions that must survive relay are at risk.
+	MinerFeeRate = btcutil.Amount(10)
 )
 
 // GenerateBlocks generates the specified number of blocks.
@@ -489,8 +504,17 @@ func (h *HarnessTest) SendOutput(output *wire.TxOut,
 
 	h.Helper()
 
-	txid, err := h.miner.SendOutputs([]*wire.TxOut{output}, feeRate)
-	require.NoError(h, err, "failed to send output")
+	return h.SendOutputs([]*wire.TxOut{output}, feeRate)
+}
+
+// SendOutputs sends funds from the miner in a single transaction.
+func (h *HarnessTest) SendOutputs(outputs []*wire.TxOut,
+	feeRate btcutil.Amount) *chainhash.Hash {
+
+	h.Helper()
+
+	txid, err := h.miner.SendOutputs(outputs, feeRate)
+	require.NoError(h, err, "failed to send outputs")
 
 	return txid
 }

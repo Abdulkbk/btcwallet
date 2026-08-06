@@ -8,10 +8,12 @@ import (
 
 	"github.com/btcsuite/btcd/btcutil/v2"
 	"github.com/btcsuite/btcd/chainhash/v2"
+	"github.com/btcsuite/btcd/txscript/v2"
 	"github.com/btcsuite/btcd/wire/v2"
 	"github.com/btcsuite/btcwallet/bwtest"
 	"github.com/btcsuite/btcwallet/waddrmgr"
 	"github.com/btcsuite/btcwallet/wallet"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
@@ -169,4 +171,99 @@ func testListUnspent(h *bwtest.HarnessTest) {
 	})
 	require.NoError(h, err, "failed to list unspent within conf range")
 	require.Len(h, utxos, 3, "conf range excluded confirmed UTXOs")
+}
+
+// testListUnspentUnconfirmed verifies that an unconfirmed payment to a wallet
+// address is listed with zero confirmations under MinConfs=0 and excluded
+// under MinConfs=1.
+//
+// The case is skipped under the neutrino backend: a light client has no
+// mempool and only emits block-derived notifications (chain/neutrino.go), so
+// the wallet can never learn about a transaction while it is unconfirmed.
+func testListUnspentUnconfirmed(h *bwtest.HarnessTest) {
+	h.Helper()
+
+	if h.Backend.Name() == "neutrino" {
+		h.Skip("neutrino cannot deliver unconfirmed transactions")
+	}
+
+	w := createWallet(h)
+	require.NoError(h, w.Start(h.Context()), "failed to start wallet")
+
+	const oneBTC = 1 * btcutil.SatoshiPerBitcoin
+
+	h.FundWallet(w, oneBTC)
+
+	addr, err := w.NewAddress(
+		h.Context(), waddrmgr.DefaultAccountName,
+		waddrmgr.WitnessPubKey, false,
+	)
+	require.NoError(h, err, "failed to create address")
+
+	pkScript, err := txscript.PayToAddrScript(addr)
+	require.NoError(h, err, "failed to create pkscript")
+
+	output := &wire.TxOut{Value: int64(oneBTC), PkScript: pkScript}
+	txid := h.SendOutput(output, bwtest.MinerFeeRate)
+
+	// The wallet learns about the unconfirmed transaction asynchronously,
+	// so poll until it appears in the listing. The closure only uses locals:
+	// testify runs each tick in its own goroutine, so capturing outer
+	// variables would race, and EventuallyWithT reports the last tick's
+	// errors so a persistent ListUnspent failure names the real cause.
+	require.EventuallyWithT(
+		h, func(c *assert.CollectT) {
+			utxos, err := w.ListUnspent(h.Context(), wallet.UtxoQuery{
+				MinConfs: 0,
+				MaxConfs: maxConfsLimit,
+			})
+			if !assert.NoError(c, err, "failed to list unspent") {
+				return
+			}
+
+			var found bool
+
+			for _, utxo := range utxos {
+				if utxo.OutPoint.Hash == *txid {
+					found = true
+				}
+			}
+
+			assert.True(c, found, "unconfirmed output not listed")
+		},
+		pollTimeout, 250*time.Millisecond,
+		"unconfirmed output did not appear",
+	)
+
+	// Re-read in the main goroutine for the field assertions so nothing is
+	// shared with the polling goroutines.
+	utxos, err := w.ListUnspent(h.Context(), wallet.UtxoQuery{
+		MinConfs: 0,
+		MaxConfs: maxConfsLimit,
+	})
+	require.NoError(h, err, "failed to list unspent with unconfirmed")
+
+	var unconfirmed *wallet.Utxo
+	for _, utxo := range utxos {
+		if utxo.OutPoint.Hash == *txid {
+			unconfirmed = utxo
+		}
+	}
+
+	require.NotNil(h, unconfirmed, "unconfirmed output missing")
+	require.Equal(
+		h, int32(0), unconfirmed.Confirmations,
+		"unconfirmed output reported confirmations",
+	)
+
+	utxos, err = w.ListUnspent(h.Context(), wallet.UtxoQuery{
+		MinConfs: 1,
+		MaxConfs: maxConfsLimit,
+	})
+	require.NoError(h, err, "failed to list unspent excluding unconfirmed")
+	require.Len(h, utxos, 1, "unconfirmed output not filtered")
+
+	// Confirm the payment so teardown finds an empty mempool.
+	tx := h.AssertTxInMempool(*txid)
+	h.MineBlockWithTx(tx)
 }

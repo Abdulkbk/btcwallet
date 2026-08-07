@@ -174,6 +174,62 @@ func testListUnspent(h *bwtest.HarnessTest) {
 	require.Len(h, utxos, 3, "conf range excluded confirmed UTXOs")
 }
 
+// testListUnspentImmatureCoinbase verifies that a freshly mined coinbase output
+// paying the wallet is reported as not spendable, because it has not reached
+// coinbase maturity.
+//
+// This is the only path that produces Spendable=false on an otherwise healthy
+// wallet, so without it the spendability branch in buildWalletUtxoFromStore is
+// never exercised.
+func testListUnspentImmatureCoinbase(h *bwtest.HarnessTest) {
+	h.Helper()
+
+	w := createWallet(h)
+	require.NoError(h, w.Start(h.Context()), "failed to start wallet")
+
+	addr := h.NewWalletAddress(w)
+
+	// Pay a single coinbase to the wallet. It is immature by construction:
+	// one confirmation is far below the coinbase maturity requirement.
+	h.MineBlockToAddress(addr)
+
+	utxos, err := w.ListUnspent(h.Context(), wallet.UtxoQuery{
+		MinConfs: 0,
+		MaxConfs: maxConfsLimit,
+	})
+	require.NoError(h, err, "failed to list unspent")
+	require.Len(h, utxos, 1, "coinbase output not listed")
+
+	coinbase := utxos[0]
+	require.Equal(
+		h, int32(1), coinbase.Confirmations, "confirmation mismatch",
+	)
+	require.False(
+		h, coinbase.Spendable, "immature coinbase reported spendable",
+	)
+	require.Less(
+		h, coinbase.Confirmations,
+		int32(h.NetParams().CoinbaseMaturity),
+		"coinbase already mature",
+	)
+
+	// GetUtxo reports the same spendability for the same output.
+	utxo, err := w.GetUtxo(h.Context(), coinbase.OutPoint)
+	require.NoError(h, err, "failed to get coinbase utxo")
+	require.False(
+		h, utxo.Spendable, "immature coinbase reported spendable",
+	)
+
+	// NOTE: The complementary case — the same output becoming spendable once
+	// it reaches maturity — is deliberately not covered here. It requires
+	// mining ~100 blocks, and the harness miner is shared across the whole
+	// suite: mining that many blocks in one batch leaves wallets behind the
+	// tip for long enough that the lag bleeds into the following test cases,
+	// while mining them one at a time costs tens of seconds per backend.
+	// Covering the maturity transition needs a batch-aware sync helper in
+	// bwtest, which belongs in its own change.
+}
+
 // testListUnspentUnconfirmed verifies that an unconfirmed payment to a wallet
 // address is listed with zero confirmations under MinConfs=0 and excluded
 // under MinConfs=1.
